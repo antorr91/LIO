@@ -1,5 +1,0 @@
-// LIO Windows resource file.
-// The numeric ID 1 is what the Windows shell picks up as the default
-// application icon for the executable (visible in Explorer and the
-// title bar). Compiled automatically by MSVC when added to the target.
-1 ICON "LIO_logo.ico"
