@@ -472,8 +472,8 @@ main{
       </div>
     </div>
     <div class="actions">
-      <label class="btn primary" for="videoFile">▣ Load Video</label>
-      <input id="videoFile" type="file" accept="video/*"/>
+      <button class="btn primary" id="loadVideoBtn" type="button">▣ Load Video</button>
+      <input id="videoFile" type="file" accept="video/*" style="display:none"/>
       <button class="btn" id="loadSessionBtn" type="button">⬚ Load Session</button>
       <input id="sessionFile" type="file" accept=".json"/>
       <div class="export-dropdown" id="exportDropdown">
@@ -738,6 +738,14 @@ function toast(msg, isError){
 }
 
 function downloadFile(filename, content, mime){
+  // When running inside the native app, use the C++ Save-As dialog.
+  if(window.chrome && window.chrome.webview){
+    window.chrome.webview.postMessage(
+      JSON.stringify({ type: 'saveCSV', filename: filename, data: content })
+    );
+    return;
+  }
+  // Fallback for plain browser.
   const blob = new Blob([content], {type: mime || 'text/plain'});
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -1049,11 +1057,56 @@ function drawTrajectory(){
 /* =========================================================
    VIDEO LOADING / PLAYBACK
    ========================================================= */
+// ── Load Video button: native dialog inside the app, file picker in browser ──
+document.getElementById('loadVideoBtn').addEventListener('click', () => {
+  if(window.chrome && window.chrome.webview){
+    // Ask C++ to show a native Windows file-open dialog.
+    window.chrome.webview.postMessage(JSON.stringify({ type: 'openVideo' }));
+  } else {
+    // Fallback: HTML file input.
+    document.getElementById('videoFile').click();
+  }
+});
+
 document.getElementById('videoFile').addEventListener('change', e => {
   const file = e.target.files[0];
   if(!file) return;
   loadVideoFromFile(file);
 });
+
+// ── Reply handler from C++ ───────────────────────────────────────────────────
+if(window.chrome && window.chrome.webview){
+  window.chrome.webview.addEventListener('message', e => {
+    try {
+      const msg = JSON.parse(e.data);
+      if(msg.type === 'videoPath'){
+        // C++ resolved the path; load it directly as a URI.
+        state.video.src = msg.path;
+        state.video.load();
+        const name = msg.path.split('/').pop().replace(/%20/g,' ');
+        state.videoFileName = name;
+        if(!document.getElementById('metaFile').value)
+          document.getElementById('metaFile').value = name.replace(/\.[^.]+$/, '');
+        state.video.addEventListener('loadedmetadata', () => {
+          state.videoLoaded = true;
+          state.arena.classList.remove('empty');
+          state.arena.style.cursor = 'crosshair';
+          updateTimeLabel();
+          toast('Video loaded · ' + name);
+        }, {once: true});
+      }
+      if(msg.type === 'csvSaved'){
+        toast('CSV saved successfully');
+      }
+    } catch(_){}
+  });
+}
+
+// Expose __nativeReply so C++ ExecuteScript can also reach us.
+window.__nativeReply = function(msg){
+  if(window.chrome && window.chrome.webview)
+    window.chrome.webview.dispatchEvent(new MessageEvent('message', {data: JSON.stringify(msg)}));
+};
 
 state.arena.addEventListener('dragover', e => { e.preventDefault(); state.arena.classList.add('dragover'); });
 state.arena.addEventListener('dragleave', () => state.arena.classList.remove('dragover'));

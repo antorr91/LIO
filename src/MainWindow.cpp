@@ -1,20 +1,21 @@
 #include "MainWindow.h"
 
+#include <commdlg.h>        // GetOpenFileName / GetSaveFileName
 #include <filesystem>
 #include <iomanip>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <wrl.h>
+
+#pragma comment(lib, "Comdlg32.lib")
 
 using Microsoft::WRL::Callback;
 
 namespace
 {
-    constexpr int         kIconId      = 101;
-    constexpr int         kWindowW     = 1400;
-    constexpr int         kWindowH     = 960;
-    constexpr const wchar_t* kClassName = L"LIO_MainWindow";
-    constexpr const wchar_t* kTitle     = L"LIO — Latent Interaction Observer";
+    constexpr const wchar_t* kClassName = L"LIO_MainWindow_v02";
+    constexpr const wchar_t* kTitle     = L"LIO \u2014 Latent Interaction Observer";
 }
 
 // ---------------------------------------------------------------------------
@@ -29,7 +30,6 @@ MainWindow::~MainWindow()
 {
     webview_.Reset();
     controller_.Reset();
-
     if (comInitialized_)
         CoUninitialize();
 }
@@ -40,6 +40,10 @@ MainWindow::~MainWindow()
 
 int MainWindow::run()
 {
+    // Make the app DPI-aware so the WebView2 renders crisply on
+    // high-resolution (4K/HiDPI) monitors.
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
     if (!createWindow())
         return 1;
 
@@ -49,7 +53,6 @@ int MainWindow::run()
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-
     return static_cast<int>(msg.wParam);
 }
 
@@ -73,7 +76,7 @@ bool MainWindow::createWindow()
         0, kClassName, kTitle,
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        kWindowW, kWindowH,
+        kInitW, kInitH,
         nullptr, nullptr, instance_, this);
 
     if (!hwnd_)
@@ -96,7 +99,7 @@ LRESULT CALLBACK MainWindow::staticWndProc(HWND hwnd, UINT msg,
     if (msg == WM_NCCREATE)
     {
         auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
-        self = static_cast<MainWindow*>(cs->lpCreateParams);
+        self     = static_cast<MainWindow*>(cs->lpCreateParams);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
         self->hwnd_ = hwnd;
     }
@@ -121,6 +124,14 @@ LRESULT MainWindow::wndProc(UINT msg, WPARAM wp, LPARAM lp)
         resizeWebView();
         return 0;
 
+    // Enforce a minimum window size so the UI never gets crushed.
+    case WM_GETMINMAXINFO:
+    {
+        auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
+        mmi->ptMinTrackSize = { kMinW, kMinH };
+        return 0;
+    }
+
     case WM_DESTROY:
         webview_.Reset();
         controller_.Reset();
@@ -139,7 +150,6 @@ LRESULT MainWindow::wndProc(UINT msg, WPARAM wp, LPARAM lp)
 void MainWindow::initWebView()
 {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-
     if (SUCCEEDED(hr))
         comInitialized_ = true;
     else if (hr != RPC_E_CHANGED_MODE)
@@ -175,7 +185,7 @@ void MainWindow::initWebView()
                             controller_->get_CoreWebView2(&webview_);
                             resizeWebView();
 
-                            // Apply settings.
+                            // ── WebView2 settings ─────────────────────────
                             Microsoft::WRL::ComPtr<ICoreWebView2Settings> settings;
                             if (SUCCEEDED(webview_->get_Settings(&settings)) && settings)
                             {
@@ -186,37 +196,172 @@ void MainWindow::initWebView()
                                 settings->put_AreDefaultContextMenusEnabled(TRUE);
                             }
 
-                            // Navigate to the bundled HTML file.
-                            const std::wstring html = htmlPath();
+                            // ── JS -> C++ message bridge ──────────────────
+                            // HTML calls: window.chrome.webview.postMessage(...)
+                            // C++ receives the JSON here and acts on it.
+                            webview_->add_WebMessageReceived(
+                                Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                                    [this](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT
+                                    {
+                                        LPWSTR raw{};
+                                        args->TryGetWebMessageAsString(&raw);
+                                        if (raw)
+                                        {
+                                            handleWebMessage(raw);
+                                            CoTaskMemFree(raw);
+                                        }
+                                        return S_OK;
+                                    }).Get(),
+                                nullptr);
 
+                            // ── Navigate to bundled HTML ──────────────────
+                            const std::wstring html = htmlPath();
                             if (!std::filesystem::exists(html))
                             {
                                 showError(L"Cannot find assets\\LIO.html next to lio.exe.");
                                 return S_OK;
                             }
-
                             webview_->Navigate(toFileUri(html).c_str());
                             return S_OK;
 
                         }).Get());
-
                 return S_OK;
-
             }).Get());
 }
 
 void MainWindow::resizeWebView()
 {
-    if (!controller_)
-        return;
-
-    RECT bounds{};
-    GetClientRect(hwnd_, &bounds);
-    controller_->put_Bounds(bounds);
+    if (!controller_) return;
+    RECT rc{};
+    GetClientRect(hwnd_, &rc);
+    controller_->put_Bounds(rc);
 }
 
 // ---------------------------------------------------------------------------
-// Path helpers
+// JS <-> C++ bridge
+//
+// HTML side (add to LIO.html):
+//
+//   // Open a video via native Windows dialog:
+//   window.chrome.webview.postMessage(JSON.stringify({ type: 'openVideo' }));
+//
+//   // Save CSV via native Windows Save-As dialog:
+//   window.chrome.webview.postMessage(JSON.stringify({ type: 'saveCSV', data: csvString }));
+//
+//   // Receive replies from C++:
+//   window.chrome.webview.addEventListener('message', e => {
+//     const msg = JSON.parse(e.data);
+//     if (msg.type === 'videoPath') { /* load video from msg.path */ }
+//   });
+// ---------------------------------------------------------------------------
+
+void MainWindow::handleWebMessage(const std::wstring& json)
+{
+    // Minimal JSON dispatch — no external parser needed for these two cases.
+
+    if (json.find(L"\"openVideo\"") != std::wstring::npos)
+    {
+        std::wstring path = openVideoDialog();
+        if (!path.empty())
+        {
+            // Send the chosen file:/// URI back to the HTML.
+            std::wstring uri  = toFileUri(path);
+            std::wstring js   = L"window.__nativeReply("
+                                L"{\"type\":\"videoPath\","
+                                L"\"path\":\"" + jsEscape(uri) + L"\"});";
+            execScript(js);
+        }
+    }
+    else if (json.find(L"\"saveCSV\"") != std::wstring::npos)
+    {
+        // Extract the "data" field (everything between first and last quote pair).
+        auto dataStart = json.find(L"\"data\"");
+        if (dataStart == std::wstring::npos) return;
+
+        dataStart = json.find(L'\"', dataStart + 6);   // opening quote of value
+        if (dataStart == std::wstring::npos) return;
+        ++dataStart;
+
+        auto dataEnd = json.rfind(L'\"');
+        if (dataEnd == std::wstring::npos || dataEnd <= dataStart) return;
+
+        std::wstring csvData = json.substr(dataStart, dataEnd - dataStart);
+
+        // Unescape \n and \t that JS JSON.stringify produces.
+        std::wstring csv;
+        for (size_t i = 0; i < csvData.size(); ++i)
+        {
+            if (csvData[i] == L'\\' && i + 1 < csvData.size())
+            {
+                wchar_t next = csvData[i + 1];
+                if      (next == L'n')  { csv += L'\n'; ++i; }
+                else if (next == L't')  { csv += L'\t'; ++i; }
+                else if (next == L'\\') { csv += L'\\'; ++i; }
+                else                    { csv += csvData[i]; }
+            }
+            else csv += csvData[i];
+        }
+
+        std::wstring savePath = saveCsvDialog();
+        if (savePath.empty()) return;
+
+        // Write UTF-8 BOM + CSV so Excel opens it correctly.
+        std::ofstream f(savePath, std::ios::binary);
+        if (!f) { showError(L"Could not write the CSV file."); return; }
+        f << "\xEF\xBB\xBF";   // UTF-8 BOM
+        for (wchar_t ch : csv)
+            f << static_cast<char>(ch);   // ASCII-safe for standard CSV
+
+        execScript(L"window.__nativeReply({\"type\":\"csvSaved\"});");
+    }
+}
+
+void MainWindow::execScript(const std::wstring& js)
+{
+    if (webview_)
+        webview_->ExecuteScript(js.c_str(), nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// Native dialogs
+// ---------------------------------------------------------------------------
+
+std::wstring MainWindow::openVideoDialog()
+{
+    wchar_t buf[MAX_PATH]{};
+
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize  = sizeof(ofn);
+    ofn.hwndOwner    = hwnd_;
+    ofn.lpstrFilter  = L"Video files\0*.mp4;*.avi;*.mov;*.mkv;*.wmv;*.webm\0"
+                       L"All files\0*.*\0";
+    ofn.lpstrFile    = buf;
+    ofn.nMaxFile     = MAX_PATH;
+    ofn.lpstrTitle   = L"Open video file";
+    ofn.Flags        = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+
+    return GetOpenFileNameW(&ofn) ? buf : L"";
+}
+
+std::wstring MainWindow::saveCsvDialog()
+{
+    wchar_t buf[MAX_PATH] = L"annotations.csv";
+
+    OPENFILENAMEW sfn{};
+    sfn.lStructSize  = sizeof(sfn);
+    sfn.hwndOwner    = hwnd_;
+    sfn.lpstrFilter  = L"CSV files\0*.csv\0All files\0*.*\0";
+    sfn.lpstrFile    = buf;
+    sfn.nMaxFile     = MAX_PATH;
+    sfn.lpstrTitle   = L"Save annotations as CSV";
+    sfn.lpstrDefExt  = L"csv";
+    sfn.Flags        = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
+
+    return GetSaveFileNameW(&sfn) ? buf : L"";
+}
+
+// ---------------------------------------------------------------------------
+// Path / URI helpers
 // ---------------------------------------------------------------------------
 
 std::wstring MainWindow::exeDir() const
@@ -231,8 +376,6 @@ std::wstring MainWindow::htmlPath() const
     return exeDir() + L"\\assets\\LIO.html";
 }
 
-// Percent-encode a local file path into a file:/// URI.
-// Compatible with older WebView2 headers (no SetVirtualHostNameToFolderMapping).
 std::wstring MainWindow::toFileUri(const std::wstring& path) const
 {
     std::wstringstream uri;
@@ -241,34 +384,34 @@ std::wstring MainWindow::toFileUri(const std::wstring& path) const
     for (wchar_t ch : path)
     {
         if (ch == L'\\')
-        {
             uri << L'/';
-        }
-        else if ((ch >= L'a' && ch <= L'z') ||
-                 (ch >= L'A' && ch <= L'Z') ||
+        else if ((ch >= L'a' && ch <= L'z') || (ch >= L'A' && ch <= L'Z') ||
                  (ch >= L'0' && ch <= L'9') ||
-                 ch == L'/' || ch == L':' ||
-                 ch == L'-' || ch == L'_' || ch == L'.')
-        {
+                 ch == L'/' || ch == L':' || ch == L'-' || ch == L'_' || ch == L'.')
             uri << ch;
-        }
         else
-        {
-            // Percent-encode any other character.
-            uri << L'%'
-                << std::uppercase << std::hex
+            uri << L'%' << std::uppercase << std::hex
                 << std::setw(2) << std::setfill(L'0')
                 << static_cast<unsigned>(static_cast<unsigned char>(ch))
                 << std::nouppercase << std::dec;
-        }
     }
-
     return uri.str();
 }
 
-// ---------------------------------------------------------------------------
-// Error reporting
-// ---------------------------------------------------------------------------
+std::wstring MainWindow::jsEscape(const std::wstring& s) const
+{
+    std::wstring out;
+    out.reserve(s.size());
+    for (wchar_t ch : s)
+    {
+        if      (ch == L'\\') out += L"\\\\";
+        else if (ch == L'"')  out += L"\\\"";
+        else if (ch == L'\n') out += L"\\n";
+        else if (ch == L'\r') out += L"\\r";
+        else                  out += ch;
+    }
+    return out;
+}
 
 void MainWindow::showError(const std::wstring& msg) const
 {

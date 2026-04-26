@@ -12,8 +12,15 @@
 // ---------------------------------------------------------------------------
 // MainWindow
 //
-// Creates a Win32 window, hosts a WebView2 control inside it, and navigates
-// to assets/LIO.html sitting next to the executable.
+// Win32 window hosting a WebView2 control.
+//
+// Improvements over v01:
+//  - DPI-aware: crisp on high-resolution / 4K displays.
+//  - Minimum window size enforced (900 x 600).
+//  - Native Windows file-open dialog for videos (GetOpenFileName).
+//  - Native Save-As dialog for CSV export (GetSaveFileName).
+//  - JS -> C++ message bridge: HTML posts messages, C++ handles them
+//    and replies by injecting JS back into the WebView.
 // ---------------------------------------------------------------------------
 class MainWindow
 {
@@ -21,28 +28,38 @@ public:
     MainWindow(HINSTANCE instance, int showCommand);
     ~MainWindow();
 
-    // Run the Win32 message loop. Returns the exit code.
     int run();
 
 private:
-    // Window procedure (static trampoline + member dispatch).
-    static LRESULT CALLBACK staticWndProc(HWND hwnd, UINT msg,
-                                          WPARAM wp, LPARAM lp);
-    LRESULT wndProc(UINT msg, WPARAM wp, LPARAM lp);
+    // Win32 plumbing.
+    static LRESULT CALLBACK staticWndProc(HWND, UINT, WPARAM, LPARAM);
+    LRESULT wndProc(UINT, WPARAM, LPARAM);
 
-    // Lifecycle helpers.
     bool createWindow();
     void initWebView();
     void resizeWebView();
 
-    // Path helpers.
-    std::wstring exeDir()      const;
-    std::wstring htmlPath()    const;
-    std::wstring toFileUri(const std::wstring& path) const;
+    // JS <-> C++ bridge.
+    void handleWebMessage(const std::wstring& json);
+    void execScript(const std::wstring& js);
 
-    void showError(const std::wstring& msg) const;
+    // Native dialogs.
+    std::wstring openVideoDialog();
+    std::wstring saveCsvDialog();
 
-private:
+    // Helpers.
+    std::wstring exeDir()                          const;
+    std::wstring htmlPath()                        const;
+    std::wstring toFileUri(const std::wstring& p)  const;
+    std::wstring jsEscape(const std::wstring& s)   const;
+    void         showError(const std::wstring& msg) const;
+
+    static constexpr int kIconId = 101;
+    static constexpr int kInitW  = 1400;
+    static constexpr int kInitH  = 960;
+    static constexpr int kMinW   = 900;
+    static constexpr int kMinH   = 600;
+
     HINSTANCE instance_{};
     int       showCommand_{};
     HWND      hwnd_{};
