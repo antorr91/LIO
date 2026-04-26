@@ -1,0 +1,27 @@
+# Build output
+build/
+out/
+
+# CMake cache
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Generated resource
+lio_resource.rc
+
+# VS / MSVC
+.vs/
+*.user
+*.suo
+*.vc.db
+*.VC.opendb
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Windows
+Thumbs.db
+Desktop.ini
