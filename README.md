@@ -2,7 +2,7 @@
   <img src="assets/LIO_logo.png" alt="LIO logo" width="120"/>
 </p>
 
-<h1 align="center">LIO — Latent Interaction Observer</h1>
+<h1 align="center">LIO — Lab Interaction Observer</h1>
 
 <p align="center">
   A desktop tool for annotating animal behaviour directly on video.<br/>
