@@ -58,7 +58,7 @@ bool MainComponent::createMainWindow()
     hwnd_ = CreateWindowExW(
         0,
         WindowClassName,
-        L"LIO - Latent Interaction Observer",
+        L"LIO - Lab Interaction Observer",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
