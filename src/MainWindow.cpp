@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include <commdlg.h>        // GetOpenFileName / GetSaveFileName
+#include <cwctype>          // towlower
 #include <filesystem>
 #include <iomanip>
 #include <fstream>
@@ -15,7 +16,7 @@ using Microsoft::WRL::Callback;
 namespace
 {
     constexpr const wchar_t* kClassName = L"LIO_MainWindow_v02";
-    constexpr const wchar_t* kTitle     = L"LIO \u2014 Latent Interaction Observer";
+    constexpr const wchar_t* kTitle     = L"LIO \u2014 Lab Interaction Observer";
 }
 
 // ---------------------------------------------------------------------------
@@ -257,19 +258,45 @@ void MainWindow::resizeWebView()
 
 void MainWindow::handleWebMessage(const std::wstring& json)
 {
-    // Minimal JSON dispatch — no external parser needed for these two cases.
+    // Minimal JSON dispatch — no external parser needed for these cases.
 
     if (json.find(L"\"openVideo\"") != std::wstring::npos)
     {
         std::wstring path = openVideoDialog();
         if (!path.empty())
         {
-            // Send the chosen file:/// URI back to the HTML.
-            std::wstring uri  = toFileUri(path);
-            std::wstring js   = L"window.__nativeReply("
-                                L"{\"type\":\"videoPath\","
-                                L"\"path\":\"" + jsEscape(uri) + L"\"});";
-            execScript(js);
+            // Read the file and hand the bytes to the HTML as base64.
+            // A blob: URL built from these bytes has no CORS restriction,
+            // so the in-app audio waveform / spectrogram works. For very
+            // large files we fall back to a plain file:/// path (video
+            // still plays; only the audio view is unavailable).
+            constexpr std::uintmax_t kMaxInlineBytes = 350ull * 1024 * 1024;
+            std::error_code ec;
+            const auto size = std::filesystem::file_size(path, ec);
+
+            if (!ec && size > 0 && size <= kMaxInlineBytes)
+            {
+                std::ifstream in(path, std::ios::binary);
+                std::string bytes((std::istreambuf_iterator<char>(in)),
+                                    std::istreambuf_iterator<char>());
+                const std::wstring b64  = base64Encode(bytes);
+                const std::wstring name = std::filesystem::path(path).filename().wstring();
+                const std::wstring mime = mimeForExtension(path);
+                std::wstring js = L"window.__nativeReply({\"type\":\"videoBytes\","
+                                  L"\"data\":\"" + b64 + L"\","
+                                  L"\"mime\":\"" + mime + L"\","
+                                  L"\"name\":\"" + jsEscape(name) + L"\"});";
+                execScript(js);
+            }
+            else
+            {
+                // Too large (or unreadable) — fall back to a path URI.
+                std::wstring uri = toFileUri(path);
+                std::wstring js  = L"window.__nativeReply("
+                                   L"{\"type\":\"videoPath\","
+                                   L"\"path\":\"" + jsEscape(uri) + L"\"});";
+                execScript(js);
+            }
         }
     }
     else if (json.find(L"\"saveCSV\"") != std::wstring::npos)
@@ -411,6 +438,54 @@ std::wstring MainWindow::jsEscape(const std::wstring& s) const
         else                  out += ch;
     }
     return out;
+}
+
+// Standard base64 encoding of a raw byte string. The result is ASCII,
+// so it is widened to wchar_t for injection into the WebView script.
+std::wstring MainWindow::base64Encode(const std::string& bytes) const
+{
+    static const char* tbl =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::wstring out;
+    out.reserve(((bytes.size() + 2) / 3) * 4);
+
+    size_t i = 0;
+    const size_t n = bytes.size();
+    while (i + 2 < n)
+    {
+        const unsigned a = static_cast<unsigned char>(bytes[i]);
+        const unsigned b = static_cast<unsigned char>(bytes[i + 1]);
+        const unsigned c = static_cast<unsigned char>(bytes[i + 2]);
+        const unsigned triple = (a << 16) | (b << 8) | c;
+        out += static_cast<wchar_t>(tbl[(triple >> 18) & 0x3F]);
+        out += static_cast<wchar_t>(tbl[(triple >> 12) & 0x3F]);
+        out += static_cast<wchar_t>(tbl[(triple >>  6) & 0x3F]);
+        out += static_cast<wchar_t>(tbl[ triple        & 0x3F]);
+        i += 3;
+    }
+    if (i < n)
+    {
+        const unsigned a = static_cast<unsigned char>(bytes[i]);
+        const unsigned b = (i + 1 < n) ? static_cast<unsigned char>(bytes[i + 1]) : 0;
+        const unsigned triple = (a << 16) | (b << 8);
+        out += static_cast<wchar_t>(tbl[(triple >> 18) & 0x3F]);
+        out += static_cast<wchar_t>(tbl[(triple >> 12) & 0x3F]);
+        out += (i + 1 < n) ? static_cast<wchar_t>(tbl[(triple >> 6) & 0x3F]) : L'=';
+        out += L'=';
+    }
+    return out;
+}
+
+std::wstring MainWindow::mimeForExtension(const std::wstring& path) const
+{
+    std::wstring ext = std::filesystem::path(path).extension().wstring();
+    for (wchar_t& c : ext) c = towlower(c);
+    if (ext == L".webm") return L"video/webm";
+    if (ext == L".ogg" || ext == L".ogv") return L"video/ogg";
+    if (ext == L".avi")  return L"video/x-msvideo";
+    if (ext == L".mov")  return L"video/quicktime";
+    if (ext == L".mkv")  return L"video/x-matroska";
+    return L"video/mp4";   // mp4 / m4v / default
 }
 
 void MainWindow::showError(const std::wstring& msg) const

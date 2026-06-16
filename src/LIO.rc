@@ -1,0 +1,5 @@
+#include "resource.h"
+
+// Associates LIO_logo.ico with the executable. The Win32 code loads it via
+// LoadIconW(instance, MAKEINTRESOURCEW(IDI_LIO_ICON)).
+IDI_LIO_ICON ICON "LIO_logo.ico"

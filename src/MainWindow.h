@@ -52,6 +52,8 @@ private:
     std::wstring htmlPath()                        const;
     std::wstring toFileUri(const std::wstring& p)  const;
     std::wstring jsEscape(const std::wstring& s)   const;
+    std::wstring base64Encode(const std::string& bytes) const;
+    std::wstring mimeForExtension(const std::wstring& path) const;
     void         showError(const std::wstring& msg) const;
 
     static constexpr int kIconId = 101;
